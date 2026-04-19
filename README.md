@@ -85,3 +85,6 @@ CFLAGS="-mfpu=neon -O3 -Wno-implicit-function-declaration -D_GNU_SOURCE" make -j
 [ПРОБЕЛ] Копировать ЭТИ 40 (не ждать окончания)
 [Ctrl+C] Полная остановка
 ```
+Версия 2 добавляет раннюю остановку пробелом:
+<img width="769" height="646" alt="image" src="https://github.com/user-attachments/assets/61da9dd4-f22d-4466-b289-329b2c26c870" />
+
