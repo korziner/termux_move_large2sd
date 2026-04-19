@@ -1,4 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
+# move_large.sh – интерактивное перемещение с РАБОЧИМ ПРОБЕЛОМ (SSH-совместимый)
+# Версия: 2.0 с мульти-методом ввода клавиш
 
 set -uo pipefail
 
@@ -19,6 +21,8 @@ VERBOSE=false
 DEBUG=false
 LOG_FILE="$HOME/move_large.log"
 USE_BFS=false
+INPUT_METHOD_USED=""
+AUTO_START_TIMEOUT=120  # Секунд до авто-старта если ввод не работает
 
 # --- Цвета и логирование ---
 if [ -t 2 ]; then
@@ -43,14 +47,15 @@ usage() {
 Опции:
   -s, --source DIR        Исходный каталог (по умолч.: \$HOME)
   -t, --target DIR        Целевой каталог на SD
-  -m, --min-size SIZE     Мин. размер (K,M,G) (по умолч.: $MIN_SIZE)
-  -x, --max-size SIZE     Макс. размер (по умолч.: $MAX_SIZE)
-  -n, --top N             Кол-во файлов (по умолч.: $TOP_N)
+  -m, --min-size SIZE     Мин. размер: K, M, G (по умолч.: 100M)
+  -x, --max-size SIZE     Макс. размер (по умолч.: 4G)
+  -n, --top N             Кол-во файлов (по умолч.: 20)
   -l, --link-type TYPE    absolute / relative
   --skip-cache            Исключить каталоги .cache
   --allow-executables     Разрешить перемещение исполняемых файлов
   --dry-run               Пробный запуск
-  --debug                 Отладочный вывод (команды + детали)
+  --debug                 Отладочный вывод
+  --auto-start SEC        Авто-старт через N сек (по умолч.: $AUTO_START_TIMEOUT)
   -h, --help              Справка
 EOF
     exit 0
@@ -200,12 +205,180 @@ filter_valid_entries() {
     awk -F'\t' 'NF>=2 && $1 ~ /^[0-9]+$/ && length($2)>0'
 }
 
-# --- Интерактивный поиск с РАБОЧИМ ПРОБЕЛОМ ---
+# ============================================================================
+# 🔥 МУЛЬТИ-МЕТОД ЧТЕНИЯ КЛАВИШ (SSH-совместимый)
+# ============================================================================
+
+# Глобальные переменные для управления вводом
+KEYBOARD_INPUT_RECEIVED=""
+KEYBOARD_INPUT_KEY=""
+INPUT_TEST_PASSED=""
+
+# Функция тестирования метода ввода
+test_input_method() {
+    local method_name="$1"
+    local test_result=""
+    
+    log_debug "🧪 Тест метода ввода: $method_name"
+    
+    case "$method_name" in
+        "dev_tty")
+            if [ -e /dev/tty ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+                test_result="PASS"
+            else
+                test_result="FAIL"
+            fi
+            ;;
+        "stty")
+            if stty -g >/dev/null 2>&1; then
+                test_result="PASS"
+            else
+                test_result="FAIL"
+            fi
+            ;;
+        "read")
+            if echo " " | read -n 1 -t 0.1 _key 2>/dev/null; then
+                test_result="PASS"
+            else
+                test_result="PASS"  # read может вернуть 1 даже при успехе
+            fi
+            ;;
+        "timeout")
+            if command -v timeout >/dev/null 2>&1; then
+                test_result="PASS"
+            else
+                test_result="FAIL"
+            fi
+            ;;
+        *)
+            test_result="FAIL"
+            ;;
+    esac
+    
+    log_debug "🧪 Метод $method_name: $test_result"
+    [ "$test_result" = "PASS" ] && return 0 || return 1
+}
+
+# Метод 1: Прямое чтение из /dev/tty
+read_key_method_dev_tty() {
+    local key=""
+    if read -t 0.1 -n 1 key < /dev/tty 2>/dev/null; then
+        if [[ "$key" == " " || "$key" == $'\x20' ]]; then
+            KEYBOARD_INPUT_KEY="SPACE"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Метод 2: stty + read из stdin
+read_key_method_stty() {
+    local key=""
+    local old_stty
+    old_stty=$(stty -g 2>/dev/null) || return 1
+    
+    stty -icanon -echo min 0 time 1 2>/dev/null || return 1
+    key=$(dd bs=1 count=1 2>/dev/null) || true
+    stty "$old_stty" 2>/dev/null || true
+    
+    if [[ "$key" == " " || "$key" == $'\x20' ]]; then
+        KEYBOARD_INPUT_KEY="SPACE"
+        return 0
+    fi
+    return 1
+}
+
+# Метод 3: read из /dev/stdin
+read_key_method_stdin() {
+    local key=""
+    if read -t 0.1 -n 1 key < /dev/stdin 2>/dev/null; then
+        if [[ "$key" == " " || "$key" == $'\x20' ]]; then
+            KEYBOARD_INPUT_KEY="SPACE"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Метод 4: timeout + cat
+read_key_method_timeout() {
+    local key=""
+    if command -v timeout >/dev/null 2>&1; then
+        key=$(timeout 0.1 cat < /dev/tty 2>/dev/null) || true
+        if [[ "$key" == " " || "$key" == $'\x20' ]]; then
+            KEYBOARD_INPUT_KEY="SPACE"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Метод 5: select + read (fallback для некоторых SSH клиентов)
+read_key_method_select() {
+    local key=""
+    PS3=""
+    select key in " " "quit" ; do
+        if [[ "$key" == " " ]]; then
+            KEYBOARD_INPUT_KEY="SPACE"
+            return 0
+        fi
+        break
+    done
+    return 1
+}
+
+# Главная функция чтения клавиши с перебором всех методов
+read_key_with_fallback() {
+    local methods=("dev_tty" "stty" "stdin" "timeout")
+    local method_used=""
+    
+    for method in "${methods[@]}"; do
+        if test_input_method "$method"; then
+            case "$method" in
+                "dev_tty")
+                    if read_key_method_dev_tty; then
+                        method_used="dev_tty"
+                        break
+                    fi
+                    ;;
+                "stty")
+                    if read_key_method_stty; then
+                        method_used="stty"
+                        break
+                    fi
+                    ;;
+                "stdin")
+                    if read_key_method_stdin; then
+                        method_used="stdin"
+                        break
+                    fi
+                    ;;
+                "timeout")
+                    if read_key_method_timeout; then
+                        method_used="timeout"
+                        break
+                    fi
+                    ;;
+            esac
+        fi
+    done
+    
+    if [ -n "$method_used" ]; then
+        INPUT_METHOD_USED="$method_used"
+        log_debug "✅ Метод ввода: $method_used"
+        return 0
+    fi
+    
+    return 1
+}
+
+# --- Интерактивный поиск с РАБОЧИМ ПРОБЕЛОМ (SSH-совместимый) ---
 search_interactive() {
     local -a args=("$@")
     local tmpfile=$(mktemp)
     local search_pid=""
     local interrupted=false
+    local auto_start_timer=0
     
     local search_cmd
     if [ "$USE_BFS" = true ]; then
@@ -220,15 +393,42 @@ search_interactive() {
 
     search_pid=$!
     
-    # 🔥 Сохраняем настройки терминала и восстанавливаем при выходе
-    local old_stty
-    old_stty=$(stty -g 2>/dev/null)
-    trap 'kill $search_pid 2>/dev/null; wait $search_pid 2>/dev/null; [ -n "$old_stty" ] && stty "$old_stty" 2>/dev/null; printf "\033[?25h\n" >&2; rm -f "$tmpfile"' EXIT INT TERM
+    # Сохраняем настройки терминала
+    local old_stty=""
+    if stty -g >/dev/null 2>&1; then
+        old_stty=$(stty -g 2>/dev/null)
+    fi
     
-    # 🔥 Отключаем канонический режим для немедленного чтения клавиш
-    stty -icanon -echo 2>/dev/null
+    # Попытка настроить терминал для неканонического режима
+    if [ -n "$old_stty" ]; then
+        stty -icanon -echo min 0 time 1 2>/dev/null || true
+    fi
+    
+    trap 'kill $search_pid 2>/dev/null; wait $search_pid 2>/dev/null; 
+          [ -n "$old_stty" ] && stty "$old_stty" 2>/dev/null; 
+          printf "\033[?25h\n" >&2; rm -f "$tmpfile"' EXIT INT TERM
     
     printf "\033[?25l" >&2
+
+    log_info "🎹 Методы ввода: перебор 4 методов + авто-старт через ${AUTO_START_TIMEOUT}с"
+    log_debug "🎹 Тестирование методов ввода..."
+    
+    # Тестируем доступные методы ввода
+    local available_methods=()
+    for method in "dev_tty" "stty" "stdin" "timeout"; do
+        if test_input_method "$method"; then
+            available_methods+=("$method")
+            log_debug "✅ Доступен метод: $method"
+        else
+            log_debug "❌ Недоступен метод: $method"
+        fi
+    done
+    
+    if [ ${#available_methods[@]} -eq 0 ]; then
+        log_warn "⚠️ Ни один метод ввода не доступен — авто-старт через ${AUTO_START_TIMEOUT}с"
+    else
+        log_info "✅ Доступные методы ввода: ${available_methods[*]}"
+    fi
 
     while kill -0 $search_pid 2>/dev/null; do
         printf "\033[2J\033[H" >&2
@@ -252,27 +452,39 @@ search_interactive() {
         echo "Найдено: $found_count файлов | Лимит: $TOP_N" >&2
         echo -e "\n[ПРОБЕЛ] Копировать ЭТИ $TOP_N (не ждать окончания)" >&2
         echo "[Ctrl+C] Полная остановка" >&2
+        echo "[Авто-старт через: $((AUTO_START_TIMEOUT - auto_start_timer)) сек]" >&2
         
-        # 🔥 Чтение из /dev/tty напрямую (не из stdin который перенаправлен)
-        # 🔥 Интервал 5 секунд вместо 0.8
-        local key=""
-        for i in $(seq 1 50); do
-            if read -t 0.1 -n 1 key < /dev/tty 2>/dev/null; then
-                if [[ "$key" == " " || "$key" == $'\x20' ]]; then
+        # 🔥 Чтение клавиши с перебором методов (каждые 0.5 сек)
+        local key_pressed=false
+        for i in $(seq 1 10); do  # 10 × 0.5с = 5 сек между обновлениями экрана
+            if read_key_with_fallback; then
+                if [ "$KEYBOARD_INPUT_KEY" = "SPACE" ]; then
+                    key_pressed=true
                     interrupted=true
                     kill $search_pid 2>/dev/null
                     echo -e "\n⏹️ Поиск прерван. Обработка найденных ($found_count файлов)..." >&2
                     break 2
                 fi
             fi
-            sleep 0.1
+            sleep 0.5
+            ((auto_start_timer++))
+            
+            # Авто-старт по таймауту
+            if [ "$auto_start_timer" -ge "$AUTO_START_TIMEOUT" ]; then
+                kill $search_pid 2>/dev/null
+                echo -e "\n⏱️ Авто-старт по таймауту. Обработка найденных ($found_count файлов)..." >&2
+                interrupted=true
+                break 2
+            fi
         done
     done
     
     wait $search_pid 2>/dev/null
     
-    # 🔥 Восстанавливаем настройки терминала
-    [ -n "$old_stty" ] && stty "$old_stty" 2>/dev/null
+    # Восстанавливаем настройки терминала
+    if [ -n "$old_stty" ]; then
+        stty "$old_stty" 2>/dev/null || true
+    fi
     printf "\033[?25h" >&2
     
     if [ -s "$tmpfile" ]; then
@@ -281,6 +493,7 @@ search_interactive() {
     
     if [ "$interrupted" = true ]; then
         echo "SEARCH_INTERRUPTED=true" >> "$LOG_FILE"
+        [ -n "$INPUT_METHOD_USED" ] && echo "INPUT_METHOD=$INPUT_METHOD_USED" >> "$LOG_FILE"
     fi
     
     rm -f "$tmpfile"
@@ -309,6 +522,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN=true; shift ;;
         --verbose) VERBOSE=true; shift ;;
         --debug) DEBUG=true; shift ;;
+        --auto-start) AUTO_START_TIMEOUT="$2"; shift 2 ;;
         -h|--help) usage ;;
         *) log_error "Неизвестный аргумент: $1"; usage ;;
     esac
@@ -397,7 +611,11 @@ file_list=("${filtered_list[@]}")
 
 if grep -q "SEARCH_INTERRUPTED=true" "$LOG_FILE" 2>/dev/null; then
     log_warn "⚡ Поиск прерван пользователем — обработка найденных файлов"
-    sed -i '/SEARCH_INTERRUPTED/d' "$LOG_FILE"
+    if grep -q "INPUT_METHOD=" "$LOG_FILE" 2>/dev/null; then
+        method=$(grep "INPUT_METHOD=" "$LOG_FILE" | cut -d= -f2)
+        log_info "🎹 Использован метод ввода: $method"
+    fi
+    sed -i '/SEARCH_INTERRUPTED/d; /INPUT_METHOD=/d' "$LOG_FILE"
 fi
 
 if [ ${#file_list[@]} -eq 0 ]; then
