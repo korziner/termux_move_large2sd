@@ -41,7 +41,7 @@ pkg install rsync
 wget https://archive.ubuntu.com/ubuntu/pool/universe/b/bfs/bfs_4.1.orig.tar.gz
 tar xfv bfs_4.1.orig.tar.gz; cd *4.1*
 CFLAGS="-mfpu=neon -O3 -Wno-implicit-function-declaration -D_GNU_SOURCE" ./configure 
-CFLAGS="-mfpu=neon -O3 -Wno-implicit-function-declaration -D_GNU_SOURCE" make -j7
+make -j7
 ```
 
 ```
